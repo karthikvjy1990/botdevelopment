@@ -1,0 +1,216 @@
+require('dotenv').config();
+const { ethers } = require("ethers");
+const fs = require("fs");
+
+// Config
+const RPC = process.env.RPC_URL || "https://arb1.arbitrum.io/rpc";
+const PRIVATE_KEY = process.env.PRIVATE_KEY;
+const CONTRACT_ADDRESS = '0x0117a2168A0047458d950Aa2652eA10305465108'; // Replace with new contract address
+
+const provider = new ethers.JsonRpcProvider(RPC);
+const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
+const contract = new ethers.Contract(CONTRACT_ADDRESS, [
+  "function initiateFlashLoan(address stableToken, uint256 amount, (uint8 buyDex, uint8 sellDex, uint256 minProfit, uint24 uniswapFeeTier) params) external",
+  "function owner() view returns (address)",
+  "event Debug(string message, uint256 value)"
+], wallet);
+
+// Token addresses
+const USDT = "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9";
+const WETH = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1";
+const USDC = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
+const AAVE_POOL = "0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb";
+const UNISWAP_V3_ROUTER = "0xE592427A0AEce92De3Edee1F18E0157C05861564";
+const SUSHISWAP_ROUTER = "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506";
+
+// Load opportunities with error handling
+let opportunities = [];
+try {
+  const opportunitiesData = JSON.parse(fs.readFileSync("scripts/opportunities.json", "utf8"));
+  opportunities = opportunitiesData.opportunities || [];
+} catch (error) {
+  console.log("No opportunities file found or invalid format. Creating empty array.");
+  opportunities = [];
+}
+
+// Constants from payload
+const ETH_USD = 4183.38;
+const GAS_PRICE_GWEI = 1.2;
+const GAS_LIMIT = 300000; // Increased to 300k
+const GAS_COST_USD = (GAS_PRICE_GWEI * GAS_LIMIT * ETH_USD) / 1e9; // ~$1.50
+const FLASH_LOAN_FEE_PCT = 0.0009; // Aave 0.09%
+const DEX_FEES = {
+  Uniswap: 0.003, // 0.3%
+  Sushiswap: 0.0025, // 0.25%
+  Camelot: 0.002 // 0.2%
+};
+
+async function checkApprovals(stableToken, amount) {
+  const token = new ethers.Contract(stableToken, ["function allowance(address owner, address spender) view returns (uint256)"], provider);
+  const usdtAllowanceAave = await token.allowance(CONTRACT_ADDRESS, AAVE_POOL);
+  const usdtAllowanceUniswap = await token.allowance(CONTRACT_ADDRESS, UNISWAP_V3_ROUTER);
+  const wethAllowanceSushiswap = await (new ethers.Contract(WETH, ["function allowance(address owner, address spender) view returns (uint256)"], provider)).allowance(CONTRACT_ADDRESS, SUSHISWAP_ROUTER);
+
+  console.log("USDT allowance (Aave):", ethers.formatUnits(usdtAllowanceAave, 6));
+  console.log("USDT allowance (Uniswap):", ethers.formatUnits(usdtAllowanceUniswap, 6));
+  console.log("WETH allowance (Sushiswap):", ethers.formatUnits(wethAllowanceSushiswap, 18));
+
+  if (usdtAllowanceAave < amount || usdtAllowanceUniswap < amount) {
+    console.log("Approving USDT...");
+    const tokenContract = new ethers.Contract(stableToken, ["function approve(address spender, uint256 amount)"], wallet);
+    try {
+      const nonce = await provider.getTransactionCount(wallet.address, "pending");
+      const tx1 = await tokenContract.approve(AAVE_POOL, ethers.parseUnits("1000000", 6), { nonce });
+      await tx1.wait();
+      const tx2 = await tokenContract.approve(UNISWAP_V3_ROUTER, ethers.parseUnits("1000000", 6), { nonce: nonce + 1 });
+      await tx2.wait();
+      console.log("USDT approved");
+    } catch (error) {
+      console.error("USDT approval failed:", error);
+      throw error;
+    }
+  }
+
+  if (wethAllowanceSushiswap < ethers.parseUnits("1000", 18)) {
+    console.log("Approving WETH...");
+    const wethContract = new ethers.Contract(WETH, ["function approve(address spender, uint256 amount)"], wallet);
+    try {
+      const nonce = await provider.getTransactionCount(wallet.address, "pending");
+      const tx = await wethContract.approve(SUSHISWAP_ROUTER, ethers.parseUnits("1000", 18), { nonce });
+      await tx.wait();
+      console.log("WETH approved");
+    } catch (error) {
+      console.error("WETH approval failed:", error);
+      throw error;
+    }
+  }
+}
+
+async function checkProfitability(stableToken, amount) {
+  const quoter = new ethers.Contract("0x61fFE014bA17989E743c5F6cB21bF9697530B21e", ["function quoteExactInputSingle((address tokenIn, address tokenOut, uint24 fee, uint256 amountIn, uint160 sqrtPriceLimitX96)) view returns (uint256, uint160, uint32, uint256)"], provider);
+  const sushiswap = new ethers.Contract(SUSHISWAP_ROUTER, ["function getAmountsOut(uint amountIn, address[] path) view returns (uint[] amounts)"], provider);
+
+  const wethOut = await quoter.quoteExactInputSingle({ tokenIn: stableToken, tokenOut: WETH, fee: 3000, amountIn: amount, sqrtPriceLimitX96: 0 });
+  const stableOut = await sushiswap.getAmountsOut(wethOut[0], [WETH, stableToken]);
+
+  console.log("WETH out (Uniswap):", ethers.formatUnits(wethOut[0], 18));
+  console.log("USDT out (Sushiswap):", ethers.formatUnits(stableOut[1], 6));
+  return stableOut[1];
+}
+
+async function executeBestOpportunity() {
+  if (opportunities.length === 0) {
+    console.log("No opportunities available");
+    return;
+  }
+
+  // Pick top opportunity
+  const best = opportunities[0];
+  console.log("Best opportunity:", best);
+
+  // Map DexType: UniswapV3=0, Sushiswap=1, Camelot=2
+  const dexMap = { 
+    "uniswap v3": 0, 
+    "uniswap v2": 0, 
+    "sushiswap": 1, 
+    "camelot v2": 2,
+    "curve v2": 3,
+    "curve v3": 3
+  };
+  
+  const buyDex = dexMap[best.buy_dex.toLowerCase()];
+  const sellDex = dexMap[best.sell_dex.toLowerCase()];
+
+  if (buyDex === undefined || sellDex === undefined) {
+    console.error(`Unsupported DEX combination: ${best.buy_dex} -> ${best.sell_dex}`);
+    return;
+  }
+
+  // Determine stable token based on pair
+  let stableToken;
+  if (best.pair.includes("USDT")) {
+    stableToken = USDT;
+  } else if (best.pair.includes("USDC")) {
+    stableToken = USDC;
+  } else {
+    console.error(`Unsupported token pair: ${best.pair}`);
+    return;
+  }
+
+  const amountUSD = best.recommended_trade_size;
+  const amountWei = ethers.parseUnits(amountUSD.toString(), 6); // USDT/USDC 6 decimals
+
+  // Calculate net profit with proper DEX fee mapping
+  const dexFeeMap = {
+    "uniswap v3": 0.003,
+    "uniswap v2": 0.003,
+    "sushiswap": 0.0025,
+    "camelot v2": 0.002,
+    "curve v2": 0.0004,
+    "curve v3": 0.0004
+  };
+  
+  const buyDexFee = dexFeeMap[best.buy_dex.toLowerCase()] || 0.003;
+  const sellDexFee = dexFeeMap[best.sell_dex.toLowerCase()] || 0.003;
+  const totalDexFees = (buyDexFee + sellDexFee) * amountUSD;
+  const flashLoanFee = amountUSD * FLASH_LOAN_FEE_PCT;
+  const estimatedProfit = best.expected_profit_usd - totalDexFees - GAS_COST_USD - flashLoanFee;
+  console.log(`Estimated net profit: $${estimatedProfit.toFixed(2)}`);
+
+  if (estimatedProfit < 1) {
+    console.log("Profit below $1, skipping");
+    return;
+  }
+
+  // Check owner
+  const owner = await contract.owner();
+  if (owner.toLowerCase() !== wallet.address.toLowerCase()) {
+    console.error("Error: Wallet is not the contract owner. Owner:", owner);
+    return;
+  }
+
+  // Check approvals
+  try {
+    await checkApprovals(stableToken, amountWei);
+  } catch (error) {
+    console.error("Approval checks failed, aborting");
+    return;
+  }
+
+  // Check profitability
+  const stableOut = await checkProfitability(stableToken, amountWei);
+  const totalRepay = amountWei + (amountWei * 9n) / 10000n; // Aave 0.09% premium
+  const minProfit = ethers.parseUnits(estimatedProfit.toFixed(6), 6);
+  if (stableOut < totalRepay + minProfit) {
+    console.log(`Trade not profitable, skipping. Expected: ${ethers.formatUnits(totalRepay + minProfit, 6)} USDT, Got: ${ethers.formatUnits(stableOut, 6)} USDT`);
+    return;
+  }
+
+  // Arbitrage params
+  const params = {
+    buyDex: buyDex,
+    sellDex: sellDex,
+    minProfit: minProfit,
+    uniswapFeeTier: 3000 // 0.3%
+  };
+
+  try {
+    console.log("Initiating flash loan...");
+    const nonce = await provider.getTransactionCount(wallet.address, "pending");
+    const tx = await contract.initiateFlashLoan(stableToken, amountWei, params, {
+      gasLimit: GAS_LIMIT,
+      gasPrice: ethers.parseUnits(GAS_PRICE_GWEI.toString(), "gwei"),
+      nonce
+    });
+    console.log("Tx sent:", tx.hash);
+    const receipt = await tx.wait();
+    console.log("Executed! Gas used:", receipt.gasUsed.toString());
+  } catch (error) {
+    console.error("Execution failed:", error);
+    if (error.reason) console.error("Revert reason:", error.reason);
+  }
+}
+
+// Run once or loop
+executeBestOpportunity();
+// setInterval(executeBestOpportunity, 10000); // Every 10s for monitoring
