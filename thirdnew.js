@@ -269,6 +269,22 @@ function encodeV3Path(tokens, fees) {
   return ethers.solidityPacked(types, values)
 }
 
+// Helper to check if an error is an expected V3 pool error (pool doesn't exist)
+function isExpectedV3Error(err) {
+  if (!err) return false
+  const errorMsg = err.message || err.toString() || ''
+  const errorCode = err.code || ''
+  
+  // Common V3 quoter errors that indicate pool doesn't exist
+  return (
+    errorMsg.includes('revert') ||
+    errorMsg.includes('CALL_EXCEPTION') ||
+    errorMsg.includes('execution reverted') ||
+    errorMsg.includes('missing revert data') ||
+    errorCode === 'CALL_EXCEPTION'
+  )
+}
+
 function generateV3Paths(tokenIn, tokenOut) {
   const start = ethers.getAddress(tokenIn)
   const end = ethers.getAddress(tokenOut)
@@ -417,15 +433,36 @@ async function getBestQuote(dexName, tokenIn, tokenOut, amountIn) {
       const pathCandidates = generateV3Paths(normalizedIn, normalizedOut)
       for (const candidate of pathCandidates) {
         try {
-          const encodedPath = encodeV3Path(candidate.tokens, candidate.fees)
-          const amountOut = await dex.quoter.quoteExactInput.staticCall(encodedPath, amountIn)
-          if (amountOut > bestQuote.amountOut) {
+          let amountOut
+          
+          // Use quoteExactInputSingle for single-hop swaps (more efficient and reliable)
+          if (candidate.tokens.length === 2) {
+            const fee = candidate.fees[0]
+            // sqrtPriceLimitX96 = 0 means no price limit
+            amountOut = await dex.quoter.quoteExactInputSingle.staticCall(
+              candidate.tokens[0],
+              candidate.tokens[1],
+              fee,
+              amountIn,
+              0n // sqrtPriceLimitX96 = 0 (no limit)
+            )
+          } else {
+            // Multi-hop: use quoteExactInput with encoded path
+            const encodedPath = encodeV3Path(candidate.tokens, candidate.fees)
+            amountOut = await dex.quoter.quoteExactInput.staticCall(encodedPath, amountIn)
+          }
+          
+          if (amountOut && amountOut > bestQuote.amountOut) {
             bestQuote = { amountOut, path: candidate.tokens, fees: candidate.fees, dexType: dex.type }
           }
         } catch (err) {
-          if (DEBUG) {
-            console.log(chalk.gray(`${dexName} V3 quote error (${candidate.tokens.join('->')}): ${err.message || err}`))
+          // Silently skip if pool doesn't exist or quote fails
+          // This is expected behavior - not all fee tiers have pools for all token pairs
+          if (DEBUG && !isExpectedV3Error(err)) {
+            const errorMsg = err.message || err.toString()
+            console.log(chalk.gray(`${dexName} V3 quote error (${candidate.tokens.join('->')}): ${errorMsg}`))
           }
+          // Expected errors (pool doesn't exist) are silently ignored
         }
       }
     }
@@ -605,15 +642,47 @@ async function onBlockScan() {
     // Loop through all loan amounts
     for (const loanAmount of LOAN_AMOUNTS_BUSD) {
       const amountIn = ethers.parseUnits(loanAmount, BASE_TOKEN.decimals)
-      scanPromises.push(scanPair(BASE_TOKEN, tokenB, amountIn))
+      // Wrap in error handling to prevent one failure from breaking the scan
+      scanPromises.push(
+        scanPair(BASE_TOKEN, tokenB, amountIn).catch(err => {
+          if (DEBUG) {
+            console.log(chalk.gray(`Scan error for ${tokenB.symbol} ${loanAmount}: ${err.message || err}`))
+          }
+          return null
+        })
+      )
     }
   }
 
-  const results = await Promise.allSettled(scanPromises)
+  // Process results with timeout protection
+  let results
+  try {
+    results = await Promise.race([
+      Promise.allSettled(scanPromises),
+      new Promise((resolve) => {
+        setTimeout(() => {
+          console.log(chalk.yellow(`  ⚠️  Scan timeout after 2s, processing partial results...`))
+          resolve('timeout')
+        }, 2000)
+      })
+    ])
+  } catch (err) {
+    if (DEBUG) console.log(chalk.gray(`Scan error: ${err.message || err}`))
+    return
+  }
   
+  if (results === 'timeout') {
+    if (DEBUG) console.log(chalk.gray(`Scan timed out. Scan took ${Date.now() - scanStartTime}ms`))
+    return
+  }
+
   results.forEach(result => {
     if (result.status === 'fulfilled' && result.value) {
       opportunities.push(result.value)
+    } else if (result.status === 'rejected') {
+      if (DEBUG) {
+        console.log(chalk.gray(`  Scan promise rejected: ${result.reason?.message || result.reason}`))
+      }
     }
   })
 
@@ -705,6 +774,17 @@ async function executeArbitrage(opp) {
 // ---------- 5. Entrypoint ----------
 (async () => {
   try {
+    // Suppress unhandled promise rejections for expected errors (like V3 pool not found)
+    process.on('unhandledRejection', (reason, promise) => {
+      // Only log unexpected errors
+      if (!isExpectedV3Error(reason)) {
+        if (DEBUG) {
+          console.error(chalk.red('Unhandled Rejection:', reason))
+        }
+      }
+      // Expected errors are silently ignored
+    })
+
     const net = await provider.getNetwork()
     console.log(chalk.cyan(`\n╔═══════════════════════════════════════╗`))
     console.log(chalk.cyan(`║     BSC ARBITRAGE BOT v3.0 (COMPETITOR) ║`))
@@ -722,24 +802,46 @@ async function executeArbitrage(opp) {
     setInterval(refreshGasPriceWei, 30_000)
 
     let isScanning = false
+    let lastBlockProcessed = 0
 
     // --- THIS IS THE CORRECT EVENT-BASED ENGINE ---
     provider.on('block', async (blockNumber) => {
       if (DEBUG) console.log(chalk.gray(`\nNew Block: ${blockNumber}`))
 
+      // Skip if we're already scanning or if this block was already processed
       if (isScanning) {
         if (DEBUG) console.log(chalk.yellow(`  Scan in progress, skipping block ${blockNumber}`))
         return
       }
-      isScanning = true
 
-      try {
-        await onBlockScan()
-      } catch (e) {
-        console.error(chalk.red(`Error during scan for block ${blockNumber}: ${e.message}`))
+      // Prevent processing the same block twice
+      if (blockNumber <= lastBlockProcessed) {
+        if (DEBUG) console.log(chalk.yellow(`  Block ${blockNumber} already processed, skipping`))
+        return
       }
 
-      isScanning = false
+      isScanning = true
+      lastBlockProcessed = blockNumber
+
+      try {
+        // Use Promise.race with timeout to ensure we don't block too long
+        await Promise.race([
+          onBlockScan(),
+          new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Scan timeout')), 3000)
+          )
+        ])
+      } catch (e) {
+        // Only log non-timeout errors
+        if (!e.message.includes('timeout')) {
+          console.error(chalk.red(`Error during scan for block ${blockNumber}: ${e.message}`))
+        } else if (DEBUG) {
+          console.log(chalk.yellow(`  Scan for block ${blockNumber} timed out, continuing...`))
+        }
+      } finally {
+        // Always reset scanning flag, even on error
+        isScanning = false
+      }
     });
 
   } catch (e) {
