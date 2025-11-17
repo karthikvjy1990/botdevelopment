@@ -116,16 +116,18 @@ const TOP_TOKENS = [
   { symbol: 'BABYDOGE', address: '0xc748673057861a797275cd8a068abb95a902e8de', decimals: 9 }, // Decimals are 9
 ]
 
+const WBNB_TOKEN = TOP_TOKENS.find(t => t.symbol === 'WBNB')
 const TOKEN_BY_ADDRESS = TOP_TOKENS.reduce((map, token) => {
   map.set(ethers.getAddress(token.address), token)
   return map
 }, new Map())
 
-const BRIDGE_TOKENS = [
-  ethers.getAddress(WBNB),
-  ethers.getAddress('0x55d398326f99059fF775485246999027B3197955'), // USDT
-  ethers.getAddress('0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d')  // USDC
-]
+const BRIDGE_TOKENS = Array.from(
+  new Set([
+    ethers.getAddress(WBNB),
+    ...SCAN_BASE_TOKENS.map(token => ethers.getAddress(token.address))
+  ])
+)
 
 // --- SETTINGS ---
 const FLASH_LOAN_FEE_BPS = 9 // 0.09%
@@ -142,6 +144,41 @@ const LOAN_AMOUNTS_BUSD = [
   '25000',  // $25,000
   '50000'   // $50,000
 ]
+
+const LOAN_AMOUNTS_BY_BASE = {
+  BUSD: LOAN_AMOUNTS_BUSD,
+  USDT: LOAN_AMOUNTS_BUSD,
+  USDC: LOAN_AMOUNTS_BUSD,
+  WBNB: ['1', '5', '10', '25', '50']
+}
+
+function getLoanAmountsForToken(token) {
+  if (!token) return LOAN_AMOUNTS_BUSD
+  return LOAN_AMOUNTS_BY_BASE[token.symbol] || LOAN_AMOUNTS_BUSD
+}
+
+function formatTokenLabel(address) {
+  try {
+    const normalized = ethers.getAddress(address)
+    const token = TOKEN_BY_ADDRESS.get(normalized)
+    if (token) return token.symbol
+    return `${normalized.slice(0, 6)}...${normalized.slice(-4)}`
+  } catch {
+    return address
+  }
+}
+
+function formatPath(path = []) {
+  if (!path.length) return 'n/a'
+  return path.map(addr => formatTokenLabel(addr)).join(' -> ')
+}
+
+function formatFees(fees = []) {
+  if (!fees.length) return 'n/a'
+  return fees.map(fee => `${(fee / 10000).toFixed(2)}%`).join(' | ')
+}
+const SCAN_BASE_TOKEN_SYMBOLS = new Set(['BUSD', 'USDT', 'USDC', 'WBNB'])
+const SCAN_BASE_TOKENS = TOP_TOKENS.filter(t => SCAN_BASE_TOKEN_SYMBOLS.has(t.symbol))
 const BASE_TOKEN = TOP_TOKENS.find(t => t.symbol === 'BUSD')
 
 // --- Global Contracts & Caches ---
@@ -157,7 +194,7 @@ const stats = {
   failed: 0,
   pairChecksFailed: 0,
   lastScanTime: 0,
-  totalProfit: 0n
+  totalProfitBusd: 0n
 }
 
 // ---------- 1. Initialization ----------
@@ -478,18 +515,75 @@ async function getBestQuote(dexName, tokenIn, tokenOut, amountIn) {
   }
 }
 
-async function getGasCostInBaseToken() {
-  const gasCostWei = gasPriceWeiCache * GAS_ESTIMATE_TOTAL // WBNB
-  
-  try {
-    // Get quote to convert WBNB gas cost to BUSD
-    const router = dexContracts['PancakeSwapV2'].router
-    const amounts = await router.getAmountsOut(gasCostWei, [WBNB, BASE_TOKEN.address])
-    return amounts[1] || 0n
-  } catch {
-    // Fallback: 0.01 WBNB ~ $5 at 3 gwei
-    return ethers.parseUnits('5', BASE_TOKEN.decimals) 
+async function convertAmountToBusd(token, amount) {
+  if (!token || !token.address || amount === 0n) return 0n
+  const router = dexContracts['PancakeSwapV2']?.router
+  if (!router) return 0n
+
+  const tokenAddr = ethers.getAddress(token.address)
+  const busdAddr = ethers.getAddress(BASE_TOKEN.address)
+
+  if (tokenAddr === busdAddr) {
+    return amount
   }
+
+  const wbnbAddr = ethers.getAddress(WBNB)
+  const candidatePaths = [
+    [tokenAddr, busdAddr],
+    [tokenAddr, wbnbAddr, busdAddr]
+  ]
+
+  for (const path of candidatePaths) {
+    try {
+      const amounts = await router.getAmountsOut(amount, path)
+      const out = amounts[amounts.length - 1]
+      if (out && out > 0n) {
+        return out
+      }
+    } catch {
+      continue
+    }
+  }
+
+  return 0n
+}
+
+async function getGasCostInToken(baseToken) {
+  const gasCostWei = gasPriceWeiCache * GAS_ESTIMATE_TOTAL // WBNB cost in wei
+  if (!baseToken) return gasCostWei
+
+  const baseAddr = ethers.getAddress(baseToken.address)
+  const wbnbAddr = ethers.getAddress(WBNB)
+
+  if (baseAddr === wbnbAddr) {
+    return gasCostWei
+  }
+
+  const router = dexContracts['PancakeSwapV2']?.router
+  if (router) {
+    try {
+      const amounts = await router.getAmountsOut(gasCostWei, [wbnbAddr, baseAddr])
+      const out = amounts[amounts.length - 1]
+      if (out && out > 0n) {
+        return out
+      }
+    } catch {
+      // fallthrough to default handling
+    }
+  }
+
+  // Fallback: convert to BUSD approximation if possible
+  try {
+    const gasCostBusd = await convertAmountToBusd(WBNB_TOKEN, gasCostWei)
+    if (baseAddr === ethers.getAddress(BASE_TOKEN.address)) {
+      return gasCostBusd
+    }
+  } catch {
+    // ignore
+  }
+
+  // Final fallback: assume ~$5 worth in target token
+  return ethers.parseUnits('5', baseToken.decimals)
 }
 
 // ---------- 3. Core Scan Logic ----------
@@ -584,13 +678,13 @@ async function scanPair(tokenA, tokenB, amountIn) {
   const rawProfit = finalAmountOut - amountIn
   
   // DEBUG LOG: We found a raw profit!
-  const rawProfitFloat = parseFloat(ethers.formatUnits(rawProfit, tokenA.decimals));
+  const rawProfitFloat = parseFloat(ethers.formatUnits(rawProfit, tokenA.decimals))
   console.log(chalk.blue(
-    `  [RAW PROFIT]: ${tokenB.symbol} | $${ethers.formatUnits(amountIn, tokenA.decimals)} | ${bestBuy.dexName} -> ${bestSell.dexName} | Raw: $${rawProfitFloat.toFixed(2)}`
-  ));
+    `  [RAW PROFIT]: ${tokenA.symbol}->${tokenB.symbol} | ${ethers.formatUnits(amountIn, tokenA.decimals)} ${tokenA.symbol} | ${bestBuy.dexName} -> ${bestSell.dexName} | Raw: ${rawProfitFloat.toFixed(4)} ${tokenA.symbol}`
+  ))
   
   const flashLoanFee = (amountIn * BigInt(FLASH_LOAN_FEE_BPS)) / 10000n
-  const gasCost = await getGasCostInBaseToken()
+  const gasCost = await getGasCostInToken(tokenA)
   
   // No safety buffer, we rely on our fast execution
   const netProfit = rawProfit - flashLoanFee - gasCost
@@ -599,8 +693,11 @@ async function scanPair(tokenA, tokenB, amountIn) {
 
   const netProfitFloat = parseFloat(ethers.formatUnits(netProfit, tokenA.decimals))
 
-  if (netProfitFloat < MIN_PROFIT_USD) {
-     if (DEBUG) console.log(chalk.yellow(`  Found net profit of $${netProfitFloat.toFixed(2)}, but below $${MIN_PROFIT_USD} min.`))
+  const netProfitBusd = await convertAmountToBusd(tokenA, netProfit)
+  const netProfitUsdFloat = parseFloat(ethers.formatUnits(netProfitBusd, BASE_TOKEN.decimals))
+
+  if (netProfitUsdFloat < MIN_PROFIT_USD) {
+     if (DEBUG) console.log(chalk.yellow(`  Found net profit of ~$${netProfitUsdFloat.toFixed(2)}, but below $${MIN_PROFIT_USD} min.`))
      return null
   }
 
@@ -621,6 +718,8 @@ async function scanPair(tokenA, tokenB, amountIn) {
     sellFees: bestSell.quote?.fees || [],
     netProfit,
     netProfitFloat,
+    netProfitBusd,
+    netProfitUsdFloat,
   }
 }
 
@@ -635,22 +734,25 @@ async function onBlockScan() {
   const opportunities = []
   const scanPromises = []
 
-  // Loop through all volatile tokens
-  for (const tokenB of TOP_TOKENS) {
-    if (tokenB.address === BASE_TOKEN.address) continue
+  // Loop through all base tokens and volatile targets
+  for (const baseToken of SCAN_BASE_TOKENS) {
+    const loanAmounts = getLoanAmountsForToken(baseToken)
 
-    // Loop through all loan amounts
-    for (const loanAmount of LOAN_AMOUNTS_BUSD) {
-      const amountIn = ethers.parseUnits(loanAmount, BASE_TOKEN.decimals)
-      // Wrap in error handling to prevent one failure from breaking the scan
-      scanPromises.push(
-        scanPair(BASE_TOKEN, tokenB, amountIn).catch(err => {
-          if (DEBUG) {
-            console.log(chalk.gray(`Scan error for ${tokenB.symbol} ${loanAmount}: ${err.message || err}`))
-          }
-          return null
-        })
-      )
+    for (const tokenB of TOP_TOKENS) {
+      if (tokenB.address === baseToken.address) continue
+
+      for (const loanAmount of loanAmounts) {
+        const amountIn = ethers.parseUnits(loanAmount, baseToken.decimals)
+        // Wrap in error handling to prevent one failure from breaking the scan
+        scanPromises.push(
+          scanPair(baseToken, tokenB, amountIn).catch(err => {
+            if (DEBUG) {
+              console.log(chalk.gray(`Scan error for ${baseToken.symbol}->${tokenB.symbol} ${loanAmount}: ${err.message || err}`))
+            }
+            return null
+          })
+        )
+      }
     }
   }
 
@@ -698,10 +800,21 @@ async function onBlockScan() {
   stats.opportunities++
   console.log(chalk.green.bold(`\n🎯🎯🎯 SPATIAL ARBITRAGE FOUND! (Scan ${stats.scans}) 🎯🎯🎯`))
   console.log(chalk.green(`  TIME: ${new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}`));
-  console.log(chalk.green(`  TOKEN: ${best.tokenB.symbol}`))
+  console.log(chalk.green(`  BASE TOKEN: ${best.tokenA.symbol}`))
+  console.log(chalk.green(`  TARGET TOKEN: ${best.tokenB.symbol}`))
   console.log(chalk.green(`  LOAN: ${ethers.formatUnits(best.amountIn, best.tokenA.decimals)} ${best.tokenA.symbol}`))
-  console.log(chalk.green(`  BUY ON: ${best.buyDex} -> SELL ON: ${best.sellDex}`))
-  console.log(chalk.green.bold(`  EST. NET PROFIT: $${best.netProfitFloat.toFixed(2)} ${best.tokenA.symbol}`))
+  console.log(chalk.green(`  ROUTE: ${best.tokenA.symbol} -> ${best.tokenB.symbol} -> ${best.tokenA.symbol}`))
+  console.log(chalk.green(`  BUY ON: ${best.buyDex}`))
+  console.log(chalk.green(`    PATH: ${formatPath(best.buyPath)}`))
+  if (best.buyFees?.length) {
+    console.log(chalk.green(`    FEES: ${formatFees(best.buyFees)}`))
+  }
+  console.log(chalk.green(`  SELL ON: ${best.sellDex}`))
+  console.log(chalk.green(`    PATH: ${formatPath(best.sellPath)}`))
+  if (best.sellFees?.length) {
+    console.log(chalk.green(`    FEES: ${formatFees(best.sellFees)}`))
+  }
+  console.log(chalk.green.bold(`  EST. NET PROFIT: ${best.netProfitFloat.toFixed(4)} ${best.tokenA.symbol} (~$${best.netProfitUsdFloat.toFixed(2)})`))
   console.log(chalk.gray(`  Scan took ${Date.now() - scanStartTime}ms`));
 
   await executeArbitrage(best)
@@ -759,7 +872,9 @@ async function executeArbitrage(opp) {
     
     if (receipt.status === 1) {
       console.log(chalk.green.bold(`  ✅✅✅ EXECUTION SUCCESSFUL! ✅✅✅`))
-      stats.totalProfit += opp.netProfit
+      if (opp.netProfitBusd) {
+        stats.totalProfitBusd += opp.netProfitBusd
+      }
     } else {
       stats.failed++
       console.log(chalk.red(`  ❌ Transaction FAILED (Reverted)`))
